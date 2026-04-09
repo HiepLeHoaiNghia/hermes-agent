@@ -179,23 +179,32 @@ def setup_verbose_logging() -> None:
 # ---------------------------------------------------------------------------
 
 class _ManagedRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler that ensures group-writable perms after rotation.
+    """RotatingFileHandler that ensures group-writable perms in managed mode.
 
     In managed mode (NixOS), the stateDir uses setgid (2770) so new files
-    inherit the hermes group. However, doRollover() creates the new log file
-    via open(), which uses the process umask — typically 0022, producing 0644.
-    This subclass applies chmod 0660 after rotation so both the gateway and
-    interactive users can write to the new log file.
+    inherit the hermes group. However, both initial creation (during __init__
+    via _open()) and rollover creation (via doRollover() -> _open()) use the
+    process umask — typically 0022, producing 0644. This subclass applies
+    chmod 0660 after each open path so both the gateway and interactive users
+    can write to the log file.
     """
 
-    def doRollover(self):
-        super().doRollover()
+    def _ensure_managed_file_mode(self) -> None:
         try:
             from hermes_cli.config import is_managed
             if is_managed():
                 os.chmod(self.baseFilename, 0o660)
         except (OSError, ImportError):
             pass
+
+    def _open(self):
+        stream = super()._open()
+        self._ensure_managed_file_mode()
+        return stream
+
+    def doRollover(self):
+        super().doRollover()
+        self._ensure_managed_file_mode()
 
 
 def _add_rotating_handler(
