@@ -439,9 +439,9 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
     mcp = FastMCP(
         "hermes",
         instructions=(
-            "Hermes Agent messaging bridge. Use these tools to interact with "
-            "conversations across Telegram, Discord, Slack, WhatsApp, Signal, "
-            "Matrix, and other connected platforms."
+            "Hermes Agent — messaging bridge. "
+            "Interact with conversations across Telegram, "
+            "Discord, Slack, WhatsApp, Signal, Matrix, and other platforms."
         ),
     )
 
@@ -825,6 +825,16 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
         result = bridge.respond_to_approval(id, decision)
         return json.dumps(result, indent=2)
+
+    # -- MemoryGrid Integration (loaded from separate module) -----------------
+
+    try:
+        from memorygrid_tools import register_memorygrid_tools
+        register_memorygrid_tools(mcp)
+    except ImportError:
+        logger.warning(
+            "memorygrid_tools not found — MemoryGrid tools not registered"
+        )
 
     return mcp
 
