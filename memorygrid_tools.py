@@ -16,14 +16,25 @@ Usage in mcp_serve.py:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import List, Optional
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
+
+def _get_hermes_home() -> Path:
+    """Resolve HERMES_HOME from constants or environment."""
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home()
+    except ImportError:
+        return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+
 
 def _get_memorygrid_root() -> Path:
     """Resolve MemoryGrid root from HERMES_HOME or environment.
@@ -35,13 +46,7 @@ def _get_memorygrid_root() -> Path:
     if mg_root:
         return Path(mg_root)
 
-    try:
-        from hermes_constants import get_hermes_home
-        hermes_home = get_hermes_home()
-    except ImportError:
-        hermes_home = Path(
-            os.environ.get("HERMES_HOME", Path.home() / ".hermes")
-        )
+    hermes_home = _get_hermes_home()
 
     if hermes_home.name == "hermes" and hermes_home.parent.name == "extension-data":
         return hermes_home.parent.parent
@@ -51,14 +56,39 @@ def _get_memorygrid_root() -> Path:
 
 def _get_lessons_file() -> Path:
     """Return path to the MemoryGrid lessons store in Hermes memories."""
+    return _get_hermes_home() / "memories" / "memorygrid-lessons.md"
+
+
+# ---------------------------------------------------------------------------
+# Holographic memory bridge
+# ---------------------------------------------------------------------------
+
+_holo_store = None
+
+
+def _get_holographic_store():
+    """Lazily initialise and return the holographic MemoryStore.
+
+    Returns None if the holographic plugin is not available (e.g., missing
+    numpy dependency). All callers should handle None gracefully.
+    """
+    global _holo_store
+    if _holo_store is not None:
+        return _holo_store
+
     try:
-        from hermes_constants import get_hermes_home
-        hermes_home = get_hermes_home()
-    except ImportError:
-        hermes_home = Path(
-            os.environ.get("HERMES_HOME", Path.home() / ".hermes")
+        from plugins.memory.holographic.store import MemoryStore
+        db_path = _get_hermes_home() / "memory_store.db"
+        _holo_store = MemoryStore(
+            db_path=str(db_path),
+            default_trust=0.5,
+            hrr_dim=1024,
         )
-    return hermes_home / "memories" / "memorygrid-lessons.md"
+        logger.info("Holographic memory store initialised at %s", db_path)
+        return _holo_store
+    except Exception as exc:
+        logger.warning("Holographic memory unavailable: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +418,9 @@ def register_memorygrid_tools(mcp) -> None:
         Agents call this when they learn something worth remembering: mistakes to
         avoid, domain patterns, project-specific conventions, or user preferences.
 
+        Dual-write: saves to both markdown file (portable backup) and holographic
+        SQLite store (semantic search, trust scoring, entity resolution).
+
         Args:
             type: Lesson type — "mistake", "pattern", "domain", "preference", "correction"
             project: Project ID (e.g., "memorygrid", "seopul", "snw")
@@ -432,12 +465,32 @@ def register_memorygrid_tools(mcp) -> None:
             with open(lessons_file, "a", encoding="utf-8") as f:
                 f.write(entry)
 
+        # --- Dual-write: holographic SQLite store ---
+        holo_tags = ",".join(
+            t.strip()
+            for t in (tags_str or "").split(",")
+            if t.strip()
+        )
+        holo = _get_holographic_store()
+        holo_ok = False
+        if holo:
+            try:
+                holo.add_fact(
+                    content=f"[{lesson_id}] {content}",
+                    category=type,
+                    tags=holo_tags,
+                )
+                holo_ok = True
+            except Exception as exc:
+                logger.warning("Holographic write failed: %s", exc)
+
         return json.dumps({
             "status": "saved",
             "lesson_id": lesson_id,
             "type": type,
             "project": project,
             "date": date_str,
+            "holographic": holo_ok,
         }, indent=2)
 
     @mcp.tool()
@@ -451,7 +504,8 @@ def register_memorygrid_tools(mcp) -> None:
         """Query accumulated lessons from Hermes persistent memory.
 
         Returns lessons matching the given filters. All filters are optional.
-        Lessons include mistakes to avoid, domain patterns, and user preferences.
+        When holographic memory is available, uses FTS5 full-text search with
+        trust-weighted ranking. Falls back to markdown file parsing otherwise.
 
         Args:
             project: Filter by project ID (e.g., "memorygrid", "seopul")
@@ -460,6 +514,42 @@ def register_memorygrid_tools(mcp) -> None:
             tags: Comma-separated tags to match (any tag matches)
             limit: Maximum number of results (default 10, max 50)
         """
+        limit = min(max(1, limit), 50)
+
+        # --- Try holographic store first ---
+        holo = _get_holographic_store()
+        if holo and (query or tags or type):
+            try:
+                search_q = query or ""
+                if tags:
+                    search_q = f"{search_q} {tags}".strip()
+
+                category = type if type else None
+                results = holo.search_facts(
+                    query=search_q,
+                    category=category,
+                    min_trust=0.0,
+                    limit=limit,
+                )
+                lessons = [
+                    {
+                        "id": f"FACT-{r['fact_id']}",
+                        "type": r.get("category", "general"),
+                        "content": r["content"],
+                        "tags": r.get("tags", "").split(",") if r.get("tags") else [],
+                        "trust": round(r.get("trust_score", 0.5), 2),
+                    }
+                    for r in results
+                ]
+                return json.dumps({
+                    "count": len(lessons),
+                    "lessons": lessons,
+                    "source": "holographic",
+                }, indent=2)
+            except Exception as exc:
+                logger.warning("Holographic query failed, falling back: %s", exc)
+
+        # --- Fallback: markdown file parsing ---
         lessons_file = _get_lessons_file()
 
         if not lessons_file.exists():
@@ -496,7 +586,7 @@ def register_memorygrid_tools(mcp) -> None:
                 if filter_tags & set(l["tags"])
             ]
 
-        lessons = lessons[:min(max(1, limit), 50)]
+        lessons = lessons[:limit]
 
         return json.dumps({"count": len(lessons), "lessons": lessons}, indent=2)
 
@@ -568,6 +658,78 @@ def register_memorygrid_tools(mcp) -> None:
             with open(lessons_file, "a", encoding="utf-8") as f:
                 f.write(entry)
 
+        # Dual-write session to holographic
+        holo = _get_holographic_store()
+        if holo:
+            try:
+                session_content = f"Task {task_id} — outcome: {outcome}"
+                if tokens_spent:
+                    session_content += f" | tokens: {tokens_spent}"
+                holo.add_fact(
+                    content=session_content,
+                    category="session",
+                    tags=f"session-record,{outcome}",
+                )
+            except Exception as exc:
+                logger.warning("Holographic session write failed: %s", exc)
+
         results["timestamp"] = datetime.now().isoformat()
 
         return json.dumps(results, indent=2)
+
+    # -- Bootstrap / seed tool ------------------------------------------------
+
+    @mcp.tool()
+    def memorygrid_seed_holographic() -> str:
+        """Import existing markdown lessons into the holographic SQLite store.
+
+        Idempotent — lessons already present (by content) are skipped due to
+        the UNIQUE constraint on facts.content. Safe to call multiple times.
+
+        Use this after a fresh install to populate the holographic DB from the
+        tracked memorygrid-lessons.md file.
+        """
+        lessons_file = _get_lessons_file()
+        holo = _get_holographic_store()
+
+        if not holo:
+            return json.dumps({
+                "status": "unavailable",
+                "message": "Holographic store not initialised",
+            })
+
+        if not lessons_file.exists():
+            return json.dumps({
+                "status": "no_source",
+                "message": "No lessons markdown file found",
+            })
+
+        try:
+            content = lessons_file.read_text(encoding="utf-8")
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
+        lessons = _parse_lessons(content)
+        imported = 0
+        skipped = 0
+
+        for lesson in lessons:
+            if lesson["type"] == "session":
+                skipped += 1
+                continue
+            try:
+                holo.add_fact(
+                    content=f"[{lesson['id']}] {lesson['content']}",
+                    category=lesson["type"],
+                    tags=",".join(lesson["tags"]),
+                )
+                imported += 1
+            except Exception:
+                skipped += 1
+
+        return json.dumps({
+            "status": "seeded",
+            "total_in_file": len(lessons),
+            "imported": imported,
+            "skipped": skipped,
+        }, indent=2)
